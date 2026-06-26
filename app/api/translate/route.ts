@@ -3,50 +3,58 @@ import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from
 import { getGlossary, buildTranslatePrompt } from '@/lib/glossary'
 import { SrtLine } from '@/types'
 
-// Gemini API တိုက်ရိုက်သုံးမယ် - OpenRouter မလို
-const GEMINI_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite-preview-06-17',
-  'gemini-2.0-flash',
-  'gemini-1.5-flash',
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+
+// Free models - တစ်ခုမရရင် နောက်တစ်ခု auto fallback
+const FREE_MODELS = [
+  'google/gemini-2.5-flash:free',
+  'google/gemini-2.5-flash-lite:free',
+  'google/gemini-2.0-flash-exp:free',
+  'google/gemini-flash-1.5:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'mistralai/mistral-7b-instruct:free',
 ]
 
-async function translateWithGemini(prompt: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set')
+async function translate(prompt: string): Promise<string> {
+  const apiKey = process.env.OPENROUTER_API_KEY
+  let lastError = ''
 
-  for (const model of GEMINI_MODELS) {
+  for (const model of FREE_MODELS) {
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
-          }),
-        }
-      )
+      const res = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          temperature: 0.3,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      })
 
       if (res.ok) {
         const data = await res.json()
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+        const text = data.choices?.[0]?.message?.content || ''
         if (text) {
-          console.log(`✓ Used: ${model}`)
+          console.log(`✓ Used model: ${model}`)
           return text
         }
       }
 
       const err = await res.json().catch(() => ({}))
-      console.warn(`✗ ${model}:`, err?.error?.message)
+      lastError = err?.error?.message || `HTTP ${res.status}`
+      console.warn(`✗ ${model}: ${lastError}`)
 
     } catch (e: any) {
-      console.warn(`✗ ${model}:`, e.message)
+      lastError = e.message
+      console.warn(`✗ ${model}: ${lastError}`)
     }
   }
 
-  throw new Error('All Gemini models failed')
+  throw new Error(`All models failed. Last error: ${lastError}`)
 }
 
 export async function POST(req: NextRequest) {
@@ -74,12 +82,12 @@ export async function POST(req: NextRequest) {
 
     for (const chunk of chunks) {
       const prompt = buildTranslatePrompt(linesToText(chunk), glossary)
-      const raw = await translateWithGemini(prompt)
+      const raw = await translate(prompt)
       const translated = parseTranslatedText(raw, chunk)
       allLines = [...allLines, ...translated]
 
       if (chunks.length > 1) {
-        await new Promise(r => setTimeout(r, 300))
+        await new Promise(r => setTimeout(r, 500))
       }
     }
 
