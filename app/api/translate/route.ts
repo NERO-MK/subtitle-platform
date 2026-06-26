@@ -4,32 +4,57 @@ import { getGlossary, buildTranslatePrompt } from '@/lib/glossary'
 import { SrtLine } from '@/types'
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
-const MODEL = 'deepseek/deepseek-chat:free'
+
+// Free models - တစ်ခုမရရင် နောက်တစ်ခု auto fallback
+const FREE_MODELS = [
+  'google/gemini-2.5-flash:free',
+  'google/gemini-2.5-flash-lite:free',
+  'google/gemini-2.0-flash-exp:free',
+  'google/gemini-flash-1.5:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'mistralai/mistral-7b-instruct:free',
+]
 
 async function translate(prompt: string): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY
+  let lastError = ''
 
-  const res = await fetch(OPENROUTER_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 4096,
-      temperature: 0.3,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  })
+  for (const model of FREE_MODELS) {
+    try {
+      const res = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          temperature: 0.3,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      })
 
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`OpenRouter ${res.status}: ${err}`)
+      if (res.ok) {
+        const data = await res.json()
+        const text = data.choices?.[0]?.message?.content || ''
+        if (text) {
+          console.log(`✓ Used model: ${model}`)
+          return text
+        }
+      }
+
+      const err = await res.json().catch(() => ({}))
+      lastError = err?.error?.message || `HTTP ${res.status}`
+      console.warn(`✗ ${model}: ${lastError}`)
+
+    } catch (e: any) {
+      lastError = e.message
+      console.warn(`✗ ${model}: ${lastError}`)
+    }
   }
 
-  const data = await res.json()
-  return data.choices?.[0]?.message?.content || ''
+  throw new Error(`All models failed. Last error: ${lastError}`)
 }
 
 export async function POST(req: NextRequest) {
@@ -48,7 +73,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!lines.length) {
-      return NextResponse.json({ error: 'Could not parse subtitle file' }, { status: 400 })
+      return NextResponse.json({ error: 'Could not parse subtitle' }, { status: 400 })
     }
 
     const glossary = glossaryId ? getGlossary(glossaryId) : undefined
