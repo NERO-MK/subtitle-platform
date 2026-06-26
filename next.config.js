@@ -1,7 +1,4 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  // yt-dlp is a system binary, not a node module
-  serverExternalPackages: [],
-}
+const nextConfig = {}
 
 module.exports = nextConfig
