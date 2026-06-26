@@ -64,3 +64,4 @@ types/
 
 ~$0.20 per episode (1000 subtitle lines)
 Sonnet 4.6: $3/M input + $15/M output tokens
+# subtitle-platform
