@@ -82,7 +82,7 @@ export default function Home() {
     // Editor အတွက် localStorage သုံးမယ် (sessionStorage မဟုတ်ဘဲ)
     try {
       localStorage.setItem('editor_lines', JSON.stringify(data2.lines))
-      localStorage.setItem('editor_title', data.title || 'subtitle')
+      localStorage.setItem('editor_title', title || 'subtitle')
     } catch (e) {}
   }
 
