@@ -2,14 +2,12 @@ import { Glossary, GlossaryTerm } from '@/types'
 
 const STORAGE_KEY = 'subtitle_glossaries'
 
-// ── Default Donghua glossary ──────────────────────────────
 export const DEFAULT_DONGHUA_GLOSSARY: Glossary = {
   id: 'default-donghua',
-  name: 'Donghua / Xianxia (Default)',
+  name: 'Donghua / Xianxia (Chinese→MM)',
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   terms: [
-    // Cultivation stages
     { id: '1', source: '修炼', target: 'ကျင့်ကြံမြောက်ခြင်း', category: 'cultivation' },
     { id: '2', source: '渡劫', target: 'ဒုက္ခဖြတ်ကျော်ခြင်း', category: 'cultivation' },
     { id: '3', source: '仙人', target: 'နတ်ဒေဝါ', category: 'cultivation' },
@@ -25,68 +23,71 @@ export const DEFAULT_DONGHUA_GLOSSARY: Glossary = {
   ],
 }
 
-// ── Load all glossaries ───────────────────────────────────
+export const DEFAULT_ENGLISH_GLOSSARY: Glossary = {
+  id: 'default-english',
+  name: 'English→MM (General)',
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  terms: [
+    { id: 'e1', source: 'Cultivation', target: 'ကျင့်ကြံမြောက်ခြင်း', category: 'cultivation' },
+    { id: 'e2', source: 'Tribulation', target: 'ဒုက္ခဖြတ်ကျော်ခြင်း', category: 'cultivation' },
+    { id: 'e3', source: 'Immortal', target: 'နတ်ဒေဝါ', category: 'cultivation' },
+    { id: 'e4', source: 'Senior', target: 'သူကြီး', category: 'general' },
+    { id: 'e5', source: 'Master', target: 'ဆရာ', category: 'general' },
+    { id: 'e6', source: 'Disciple', target: 'တပည့်', category: 'general' },
+  ],
+}
+
 export function loadGlossaries(): Glossary[] {
-  if (typeof window === 'undefined') return [DEFAULT_DONGHUA_GLOSSARY]
+  if (typeof window === 'undefined') return [DEFAULT_DONGHUA_GLOSSARY, DEFAULT_ENGLISH_GLOSSARY]
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     const saved: Glossary[] = raw ? JSON.parse(raw) : []
-    // Always include default
-    const hasDefault = saved.find(g => g.id === DEFAULT_DONGHUA_GLOSSARY.id)
-    return hasDefault ? saved : [DEFAULT_DONGHUA_GLOSSARY, ...saved]
+    const result = [...saved]
+    if (!result.find(g => g.id === DEFAULT_DONGHUA_GLOSSARY.id)) result.unshift(DEFAULT_DONGHUA_GLOSSARY)
+    if (!result.find(g => g.id === DEFAULT_ENGLISH_GLOSSARY.id)) result.splice(1, 0, DEFAULT_ENGLISH_GLOSSARY)
+    return result
   } catch {
-    return [DEFAULT_DONGHUA_GLOSSARY]
+    return [DEFAULT_DONGHUA_GLOSSARY, DEFAULT_ENGLISH_GLOSSARY]
   }
 }
 
-// ── Save glossaries ───────────────────────────────────────
 export function saveGlossaries(glossaries: Glossary[]): void {
   if (typeof window === 'undefined') return
   localStorage.setItem(STORAGE_KEY, JSON.stringify(glossaries))
 }
 
-// ── Get single glossary ───────────────────────────────────
 export function getGlossary(id: string): Glossary | undefined {
   return loadGlossaries().find(g => g.id === id)
 }
 
-// ── Build glossary prompt block for Claude ────────────────
 export function buildGlossaryPrompt(glossary: Glossary): string {
   if (!glossary.terms.length) return ''
-
-  const lines = glossary.terms.map(
-    t => `${t.source} → ${t.target}${t.notes ? ` (${t.notes})` : ''}`
-  )
-
-  return `
-TRANSLATION GLOSSARY (must use these exact translations):
-${lines.join('\n')}
-
-These terms MUST be translated exactly as shown above. Do not deviate.
-`.trim()
+  const lines = glossary.terms.map(t => `${t.source} → ${t.target}`)
+  return `TRANSLATION GLOSSARY (use exactly):\n${lines.join('\n')}\n`
 }
 
-// ── Build full Claude translate prompt ───────────────────
-export function buildTranslatePrompt(
-  linesText: string,
-  glossary?: Glossary
-): string {
+export function buildTranslatePrompt(linesText: string, glossary?: Glossary): string {
   const glossaryBlock = glossary ? buildGlossaryPrompt(glossary) : ''
 
-  return `You are a professional subtitle translator specializing in Chinese Donghua (animated series) to Myanmar (Burmese) translation.
+  // Glossary ID ကြည့်ပြီး source language သိနိုင်တယ်
+  const isEnglish = glossary?.id?.includes('english') || 
+                    glossary?.name?.toLowerCase().includes('english')
+
+  const sourceLang = isEnglish ? 'English' : 'Chinese (Mandarin)'
+
+  return `You are a professional subtitle translator from ${sourceLang} to Myanmar (Burmese).
 
 ${glossaryBlock}
-
 RULES:
-- Translate ONLY the dialogue text, preserve the [number] tags exactly
-- Keep Myanmar translation natural and conversational, not literal
-- Preserve line breaks within a subtitle block
-- For names without a glossary entry, transliterate to Myanmar script
-- Do not add explanations or notes
-- Output format must be exactly: [number] translated text
+- Translate ONLY the dialogue, keep [number] tags exactly as-is
+- Myanmar translation must be natural, conversational — not word-for-word literal
+- For names without glossary entry: if Chinese, transliterate to Myanmar script; if English, keep the English name
+- No explanations, no notes, output only translations
+- Format: [number] translated text
 
-INPUT SUBTITLES:
+INPUT:
 ${linesText}
 
-OUTPUT (Myanmar translation only):`
+OUTPUT (Myanmar only):`
 }
