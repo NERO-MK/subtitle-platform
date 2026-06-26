@@ -1,9 +1,7 @@
 import { SrtLine } from '@/types'
 
-// ── Parse .srt text → SrtLine[] ───────────────────────────
 export function parseSrt(content: string): SrtLine[] {
   const lines: SrtLine[] = []
-  // Normalize line endings
   const blocks = content.replace(/\r\n/g, '\n').trim().split(/\n\n+/)
 
   for (const block of blocks) {
@@ -20,7 +18,6 @@ export function parseSrt(content: string): SrtLine[] {
     if (!timeMatch) continue
 
     const text = parts.slice(2).join('\n').trim()
-
     lines.push({
       index,
       startTime: timeMatch[1].replace('.', ','),
@@ -28,11 +25,9 @@ export function parseSrt(content: string): SrtLine[] {
       text,
     })
   }
-
   return lines
 }
 
-// ── SrtLine[] → .srt file string ─────────────────────────
 export function formatSrt(lines: SrtLine[], useTranslated = false): string {
   return lines
     .map((line, i) => {
@@ -42,7 +37,6 @@ export function formatSrt(lines: SrtLine[], useTranslated = false): string {
     .join('\n\n')
 }
 
-// ── Parse VTT (YouTube auto-subtitle format) → SrtLine[] ──
 export function parseVtt(content: string): SrtLine[] {
   const lines: SrtLine[] = []
   const cleaned = content
@@ -65,7 +59,6 @@ export function parseVtt(content: string): SrtLine[] {
     )
     if (!timeMatch) continue
 
-    // Strip VTT tags <c>, <00:00:00.000>, etc.
     const textLines = parts
       .slice(timeLineIdx + 1)
       .join('\n')
@@ -81,13 +74,10 @@ export function parseVtt(content: string): SrtLine[] {
       text: textLines,
     })
   }
-
   return lines
 }
 
-// ── Split lines into chunks for Claude API ────────────────
-// Claude has context window limits — translate in batches
-export function chunkLines(lines: SrtLine[], chunkSize = 80): SrtLine[][] {
+export function chunkLines(lines: SrtLine[], chunkSize = 60): SrtLine[][] {
   const chunks: SrtLine[][] = []
   for (let i = 0; i < lines.length; i += chunkSize) {
     chunks.push(lines.slice(i, i + chunkSize))
@@ -95,14 +85,10 @@ export function chunkLines(lines: SrtLine[], chunkSize = 80): SrtLine[][] {
   return chunks
 }
 
-// ── Build plain text from lines for translation input ─────
 export function linesToText(lines: SrtLine[]): string {
-  return lines
-    .map(l => `[${l.index}] ${l.text}`)
-    .join('\n')
+  return lines.map(l => `[${l.index}] ${l.text}`).join('\n')
 }
 
-// ── Parse Claude's translated output back to lines ────────
 export function parseTranslatedText(
   raw: string,
   originalLines: SrtLine[]
@@ -110,15 +96,28 @@ export function parseTranslatedText(
   const result = [...originalLines]
   const translatedMap = new Map<number, string>()
 
-  // Match [index] translated text patterns
-  const regex = /\[(\d+)\]\s*(.+?)(?=\n\[\d+\]|\n*$)/gs
-  let match
+  // s flag မသုံးဘဲ line-by-line parse လုပ်မယ်
+  const rawLines = raw.split('\n')
+  let currentIndex: number | null = null
+  let currentText: string[] = []
 
-  while ((match = regex.exec(raw)) !== null) {
-    const idx = parseInt(match[1], 10)
-    const text = match[2].trim()
-    translatedMap.set(idx, text)
+  const flush = () => {
+    if (currentIndex !== null && currentText.length) {
+      translatedMap.set(currentIndex, currentText.join(' ').trim())
+    }
   }
+
+  for (const line of rawLines) {
+    const match = line.match(/^\[(\d+)\]\s*(.*)/)
+    if (match) {
+      flush()
+      currentIndex = parseInt(match[1], 10)
+      currentText = match[2] ? [match[2]] : []
+    } else if (currentIndex !== null && line.trim()) {
+      currentText.push(line.trim())
+    }
+  }
+  flush()
 
   return result.map(line => ({
     ...line,
