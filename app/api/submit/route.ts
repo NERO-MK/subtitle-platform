@@ -3,15 +3,37 @@ import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
 import { sendMessage } from '@/lib/telegram'
 import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
 import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
-import { exec } from 'child_process'
-import { promisify } from 'util'
-import { readFile, readdir, rm } from 'fs/promises'
+import { rm, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { SrtLine } from '@/types'
+// @ts-ignore
+import ytDlp from 'yt-dlp-exec'
 
-const execAsync = promisify(exec)
+async function downloadSubtitle(url: string, jobDir: string): Promise<string> {
+  await mkdir(jobDir, { recursive: true })
+
+  // yt-dlp-exec သုံးမယ် — system binary မလို
+  const result = await ytDlp(url, {
+    skipDownload: true,
+    writeSubs: true,
+    writeAutoSubs: true,
+    subLangs: 'zh-Hans,zh,en',
+    subFormat: 'vtt/srt/best',
+    convertSubs: 'srt',
+    output: join(jobDir, '%(title)s.%(ext)s'),
+    noPlaylist: true,
+    dumpSingleJson: false,
+  })
+
+  // Find subtitle file
+  const { readdir, readFile } = await import('fs/promises')
+  const files = await readdir(jobDir)
+  const subFile = files.find(f => f.endsWith('.srt') || f.endsWith('.vtt'))
+  if (!subFile) throw new Error('No subtitle found for this video')
+  return readFile(join(jobDir, subFile), 'utf-8')
+}
 
 async function callGemini(prompt: string): Promise<string> {
   for (const model of ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
@@ -37,10 +59,10 @@ async function callGemini(prompt: string): Promise<string> {
   throw new Error('Gemini failed')
 }
 
-async function translateSrt(content: string): Promise<SrtLine[]> {
+async function translateSrt(content: string, glossaryId?: string): Promise<SrtLine[]> {
   const lines = content.trim().startsWith('WEBVTT') ? parseVtt(content) : parseSrt(content)
   if (!lines.length) throw new Error('Could not parse subtitle')
-  const glossary = getGlossary('default-donghua')
+  const glossary = getGlossary(glossaryId || 'default-donghua')
   const chunks = chunkLines(lines, 60)
   let all: SrtLine[] = []
   for (const chunk of chunks) {
@@ -62,9 +84,9 @@ async function generateContent(lines: SrtLine[], title: string) {
 }
 
 function formatSrt(lines: SrtLine[], translated: boolean) {
-  return lines
-    .map((l, i) => `${i + 1}\n${l.startTime} --> ${l.endTime}\n${translated && l.translated ? l.translated : l.text}`)
-    .join('\n\n')
+  return lines.map((l, i) =>
+    `${i + 1}\n${l.startTime} --> ${l.endTime}\n${translated && l.translated ? l.translated : l.text}`
+  ).join('\n\n')
 }
 
 export async function POST(req: NextRequest) {
@@ -72,65 +94,49 @@ export async function POST(req: NextRequest) {
 
   try {
     const { url, title, telegram_chat_id, glossaryId } = await req.json()
-
     if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
 
-    await execAsync(`mkdir -p ${jobDir}`)
+    // Download subtitle
+    const srtContent = await downloadSubtitle(url, jobDir)
+    const videoTitle = title || 'Video'
 
-    // Step 1: Download subtitle
-    const cmd = `yt-dlp --skip-download --write-subs --write-auto-subs --sub-langs "zh-Hans,zh,en" --sub-format "vtt/srt/best" --convert-subs srt --output "${join(jobDir, '%(title)s.%(ext)s')}" --no-playlist "${url}"`
-    await execAsync(cmd, { timeout: 30000 })
+    // Translate
+    const lines = await translateSrt(srtContent, glossaryId)
 
-    const files = await readdir(jobDir)
-    const subFile = files.find(f => f.endsWith('.srt') || f.endsWith('.vtt'))
-    if (!subFile) throw new Error('No subtitle found for this video')
-
-    const srtContent = await readFile(join(jobDir, subFile), 'utf-8')
-    const videoTitle = title || subFile.replace(/\.(srt|vtt)$/, '').slice(0, 60)
-
-    // Step 2: Translate
-    const lines = await translateSrt(srtContent)
-
-    // Step 3: Generate recap + highlights + captions
+    // Generate content
     const { recap, highlights, captions } = await generateContent(lines, videoTitle)
 
-    // Step 4: Upload to B2
+    // Upload to B2
     const jobId = randomUUID().slice(0, 8)
-    const enKey = `jobs/${jobId}/subtitle.en.srt`
-    const mmKey = `jobs/${jobId}/subtitle.mm.srt`
-    const recapKey = `jobs/${jobId}/recap.txt`
-    const highlightsKey = `jobs/${jobId}/highlights.txt`
-    const captionsKey = `jobs/${jobId}/captions.txt`
+    const keys = {
+      en: `jobs/${jobId}/subtitle.en.srt`,
+      mm: `jobs/${jobId}/subtitle.mm.srt`,
+      recap: `jobs/${jobId}/recap.txt`,
+      highlights: `jobs/${jobId}/highlights.txt`,
+      captions: `jobs/${jobId}/captions.txt`,
+    }
 
     await Promise.all([
-      uploadToB2(enKey, formatSrt(lines, false)),
-      uploadToB2(mmKey, formatSrt(lines, true)),
-      uploadToB2(recapKey, recap),
-      uploadToB2(highlightsKey, highlights),
-      uploadToB2(captionsKey, captions),
+      uploadToB2(keys.en, formatSrt(lines, false)),
+      uploadToB2(keys.mm, formatSrt(lines, true)),
+      uploadToB2(keys.recap, recap),
+      uploadToB2(keys.highlights, highlights),
+      uploadToB2(keys.captions, captions),
     ])
 
-    // Step 5: Get signed URLs (24h)
     const [enUrl, mmUrl, recapUrl, highlightsUrl, captionsUrl] = await Promise.all([
-      getSignedDownloadUrl(enKey),
-      getSignedDownloadUrl(mmKey),
-      getSignedDownloadUrl(recapKey),
-      getSignedDownloadUrl(highlightsKey),
-      getSignedDownloadUrl(captionsKey),
+      getSignedDownloadUrl(keys.en),
+      getSignedDownloadUrl(keys.mm),
+      getSignedDownloadUrl(keys.recap),
+      getSignedDownloadUrl(keys.highlights),
+      getSignedDownloadUrl(keys.captions),
     ])
 
-    // Step 6: Telegram notify
+    // Telegram notify
     if (telegram_chat_id) {
-      const msg = `✅ <b>${videoTitle}</b> ပြီးပြီ!
-
-📥 <b>Download (24h):</b>
-🇲🇲 <a href="${mmUrl}">Myanmar .srt</a>
-🇬🇧 <a href="${enUrl}">English .srt</a>
-📝 <a href="${recapUrl}">Recap</a>
-🎯 <a href="${highlightsUrl}">Highlights</a>
-📱 <a href="${captionsUrl}">Captions + Hashtags</a>`
-
-      await sendMessage(telegram_chat_id, msg)
+      await sendMessage(telegram_chat_id,
+        `✅ <b>${videoTitle}</b> ပြီးပြီ!\n\n📥 <b>Download (24h):</b>\n🇲🇲 <a href="${mmUrl}">Myanmar .srt</a>\n🇬🇧 <a href="${enUrl}">English .srt</a>\n📝 <a href="${recapUrl}">Recap</a>\n🎯 <a href="${highlightsUrl}">Highlights</a>\n📱 <a href="${captionsUrl}">Captions</a>`
+      )
     }
 
     return NextResponse.json({
@@ -147,6 +153,6 @@ export async function POST(req: NextRequest) {
     console.error('Submit error:', err)
     return NextResponse.json({ error: err.message || 'Failed' }, { status: 500 })
   } finally {
-    await rm(jobDir, { recursive: true, force: true })
+    await rm(jobDir, { recursive: true, force: true }).catch(() => {})
   }
 }
