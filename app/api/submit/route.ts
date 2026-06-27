@@ -3,46 +3,113 @@ import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
 import { sendMessage } from '@/lib/telegram'
 import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
 import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
-import { rm, mkdir, readdir, readFile } from 'fs/promises'
-import { join } from 'path'
-import { tmpdir } from 'os'
-import { randomUUID } from 'crypto'
 import { SrtLine } from '@/types'
-import { exec } from 'child_process'
-import { promisify } from 'util'
+import { randomUUID } from 'crypto'
 
-const execAsync = promisify(exec)
+// cobalt.tools API — free, no binary needed
+async function downloadSubtitle(url: string): Promise<string> {
+  // Method 1: cobalt.tools မှာ video info ယူပြီး subtitle URL ရှာ
+  // Method 2: YouTube transcript API သုံး
+  
+  // YouTube video ID ထုတ်မယ်
+  const videoId = extractYouTubeId(url)
+  if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး။ YouTube link သာ support လုပ်တယ်')
 
-// yt-dlp-exec binary path
-function getYtDlpPath(): string {
-  try {
-    // yt-dlp-exec package ထဲက binary
-    const pkg = require.resolve('yt-dlp-exec/bin/yt-dlp')
-    return pkg
-  } catch {
-    // fallback paths
-    const paths = [
-      join(process.cwd(), 'node_modules/yt-dlp-exec/bin/yt-dlp'),
-      join(process.cwd(), 'node_modules/.bin/yt-dlp'),
-      '/var/task/node_modules/yt-dlp-exec/bin/yt-dlp',
-    ]
-    return paths[0]
+  // YouTube transcript ဆွဲမယ် (timedtext API)
+  const langs = ['zh-Hans', 'zh', 'en']
+  
+  for (const lang of langs) {
+    try {
+      const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`
+      const res = await fetch(transcriptUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      })
+      
+      if (res.ok) {
+        const text = await res.text()
+        if (text && text.length > 100) {
+          console.log(`Got transcript in ${lang}`)
+          return convertTimedTextToSrt(text)
+        }
+      }
+    } catch {}
   }
+
+  // Auto-generated subtitle (asr)
+  for (const lang of ['zh-Hans', 'zh', 'en']) {
+    try {
+      const asrUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&kind=asr&fmt=srv3`
+      const res = await fetch(asrUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      })
+      if (res.ok) {
+        const text = await res.text()
+        if (text && text.length > 100) {
+          console.log(`Got ASR transcript in ${lang}`)
+          return convertTimedTextToSrt(text)
+        }
+      }
+    } catch {}
+  }
+
+  throw new Error('Subtitle မတွေ့ဘူး။ ဒီ video မှာ subtitle မပါဘူး ဖြစ်နိုင်တယ်')
 }
 
-async function downloadSubtitle(url: string, jobDir: string): Promise<string> {
-  await mkdir(jobDir, { recursive: true })
+function extractYouTubeId(url: string): string | null {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
+    /^([a-zA-Z0-9_-]{11})$/,
+  ]
+  for (const p of patterns) {
+    const m = url.match(p)
+    if (m) return m[1]
+  }
+  return null
+}
 
-  const ytdlp = getYtDlpPath()
-  const cmd = `"${ytdlp}" --skip-download --write-subs --write-auto-subs --sub-langs "zh-Hans,zh,en" --sub-format "vtt/srt/best" --convert-subs srt --output "${join(jobDir, '%(title)s.%(ext)s')}" --no-playlist "${url}"`
+function convertTimedTextToSrt(xml: string): string {
+  // Parse YouTube timedtext XML → SRT format
+  const lines: string[] = []
+  let index = 1
 
-  console.log('yt-dlp path:', ytdlp)
-  await execAsync(cmd, { timeout: 30000 })
+  // Match <p t="start" d="duration">text</p> or <s ac="0">text</s>
+  const pRegex = /<p[^>]+t="(\d+)"[^>]+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g
+  let match
 
-  const files = await readdir(jobDir)
-  const subFile = files.find(f => f.endsWith('.srt') || f.endsWith('.vtt'))
-  if (!subFile) throw new Error('No subtitle found for this video')
-  return readFile(join(jobDir, subFile), 'utf-8')
+  while ((match = pRegex.exec(xml)) !== null) {
+    const startMs = parseInt(match[1])
+    const durationMs = parseInt(match[2])
+    const endMs = startMs + durationMs
+
+    // Strip XML tags from text
+    const text = match[3]
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .trim()
+
+    if (!text) continue
+
+    const start = msToSrtTime(startMs)
+    const end = msToSrtTime(endMs)
+
+    lines.push(`${index}\n${start} --> ${end}\n${text}`)
+    index++
+  }
+
+  if (!lines.length) throw new Error('Subtitle parse မဖြစ်ဘူး')
+  return lines.join('\n\n')
+}
+
+function msToSrtTime(ms: number): string {
+  const h = Math.floor(ms / 3600000)
+  const m = Math.floor((ms % 3600000) / 60000)
+  const s = Math.floor((ms % 60000) / 1000)
+  const mil = ms % 1000
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(mil).padStart(3,'0')}`
 }
 
 async function callGemini(prompt: string): Promise<string> {
@@ -93,20 +160,18 @@ async function generateContent(lines: SrtLine[], title: string) {
   return { recap, highlights, captions }
 }
 
-function formatSrt(lines: SrtLine[], translated: boolean) {
+function formatSrtFile(lines: SrtLine[], translated: boolean) {
   return lines.map((l, i) =>
     `${i + 1}\n${l.startTime} --> ${l.endTime}\n${translated && l.translated ? l.translated : l.text}`
   ).join('\n\n')
 }
 
 export async function POST(req: NextRequest) {
-  const jobDir = join(tmpdir(), `job_${randomUUID()}`)
-
   try {
     const { url, title, telegram_chat_id, glossaryId } = await req.json()
     if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
 
-    const srtContent = await downloadSubtitle(url, jobDir)
+    const srtContent = await downloadSubtitle(url)
     const videoTitle = title || 'Video'
     const lines = await translateSrt(srtContent, glossaryId)
     const { recap, highlights, captions } = await generateContent(lines, videoTitle)
@@ -121,8 +186,8 @@ export async function POST(req: NextRequest) {
     }
 
     await Promise.all([
-      uploadToB2(keys.en, formatSrt(lines, false)),
-      uploadToB2(keys.mm, formatSrt(lines, true)),
+      uploadToB2(keys.en, formatSrtFile(lines, false)),
+      uploadToB2(keys.mm, formatSrtFile(lines, true)),
       uploadToB2(keys.recap, recap),
       uploadToB2(keys.highlights, highlights),
       uploadToB2(keys.captions, captions),
@@ -151,7 +216,5 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     console.error('Submit error:', err)
     return NextResponse.json({ error: err.message || 'Failed' }, { status: 500 })
-  } finally {
-    await rm(jobDir, { recursive: true, force: true }).catch(() => {})
   }
 }
