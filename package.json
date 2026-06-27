@@ -11,13 +11,17 @@
     "next": "14.2.5",
     "react": "^18",
     "react-dom": "^18",
-    "@anthropic-ai/sdk": "^0.27.0",
-    "yt-dlp-exec": "^1.0.2"
+    "yt-dlp-exec": "^1.0.2",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "@supabase/supabase-js": "^2.44.0"
   },
   "devDependencies": {
     "typescript": "^5",
     "@types/node": "^20",
     "@types/react": "^18",
+    "@babel/core": "^7",
+    "babel-loader": "^9",
     "tailwindcss": "^3.4.1",
     "postcss": "^8",
     "autoprefixer": "^10"
