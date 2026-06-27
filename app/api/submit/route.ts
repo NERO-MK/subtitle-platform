@@ -1,0 +1,152 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
+import { sendMessage } from '@/lib/telegram'
+import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
+import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+import { readFile, readdir, rm } from 'fs/promises'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import { randomUUID } from 'crypto'
+import { SrtLine } from '@/types'
+
+const execAsync = promisify(exec)
+
+async function callGemini(prompt: string): Promise<string> {
+  for (const model of ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
+          }),
+        }
+      )
+      if (res.ok) {
+        const d = await res.json()
+        const text = d.candidates?.[0]?.content?.parts?.[0]?.text || ''
+        if (text) return text
+      }
+    } catch {}
+  }
+  throw new Error('Gemini failed')
+}
+
+async function translateSrt(content: string): Promise<SrtLine[]> {
+  const lines = content.trim().startsWith('WEBVTT') ? parseVtt(content) : parseSrt(content)
+  if (!lines.length) throw new Error('Could not parse subtitle')
+  const glossary = getGlossary('default-donghua')
+  const chunks = chunkLines(lines, 60)
+  let all: SrtLine[] = []
+  for (const chunk of chunks) {
+    const raw = await callGemini(buildTranslatePrompt(linesToText(chunk), glossary))
+    all = [...all, ...parseTranslatedText(raw, chunk)]
+    if (chunks.length > 1) await new Promise(r => setTimeout(r, 300))
+  }
+  return all
+}
+
+async function generateContent(lines: SrtLine[], title: string) {
+  const text = lines.map(l => l.translated || l.text).join('\n').slice(0, 6000)
+  const [recap, highlights, captions] = await Promise.all([
+    callGemini(`"${title}" ဇာတ်လမ်း၏ Myanmar ဘာသာဖြင့် 150 စကားလုံး recap ရေးပါ။\n${text}`),
+    callGemini(`"${title}" မှ အကောင်းဆုံး moments 5 ခုကို timestamp နဲ့ Myanmar ဘာသာဖြင့်။\nFormat: [timestamp] - ဖော်ပြချက်\n${text}`),
+    callGemini(`"${title}" အတွက် TikTok/Facebook Myanmar captions 3 ခု နှင့် hashtags 10 ခု။ Emoji ထည့်ပါ။\n${text.slice(0, 2000)}`),
+  ])
+  return { recap, highlights, captions }
+}
+
+function formatSrt(lines: SrtLine[], translated: boolean) {
+  return lines
+    .map((l, i) => `${i + 1}\n${l.startTime} --> ${l.endTime}\n${translated && l.translated ? l.translated : l.text}`)
+    .join('\n\n')
+}
+
+export async function POST(req: NextRequest) {
+  const jobDir = join(tmpdir(), `job_${randomUUID()}`)
+
+  try {
+    const { url, title, telegram_chat_id, glossaryId } = await req.json()
+
+    if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
+
+    await execAsync(`mkdir -p ${jobDir}`)
+
+    // Step 1: Download subtitle
+    const cmd = `yt-dlp --skip-download --write-subs --write-auto-subs --sub-langs "zh-Hans,zh,en" --sub-format "vtt/srt/best" --convert-subs srt --output "${join(jobDir, '%(title)s.%(ext)s')}" --no-playlist "${url}"`
+    await execAsync(cmd, { timeout: 30000 })
+
+    const files = await readdir(jobDir)
+    const subFile = files.find(f => f.endsWith('.srt') || f.endsWith('.vtt'))
+    if (!subFile) throw new Error('No subtitle found for this video')
+
+    const srtContent = await readFile(join(jobDir, subFile), 'utf-8')
+    const videoTitle = title || subFile.replace(/\.(srt|vtt)$/, '').slice(0, 60)
+
+    // Step 2: Translate
+    const lines = await translateSrt(srtContent)
+
+    // Step 3: Generate recap + highlights + captions
+    const { recap, highlights, captions } = await generateContent(lines, videoTitle)
+
+    // Step 4: Upload to B2
+    const jobId = randomUUID().slice(0, 8)
+    const enKey = `jobs/${jobId}/subtitle.en.srt`
+    const mmKey = `jobs/${jobId}/subtitle.mm.srt`
+    const recapKey = `jobs/${jobId}/recap.txt`
+    const highlightsKey = `jobs/${jobId}/highlights.txt`
+    const captionsKey = `jobs/${jobId}/captions.txt`
+
+    await Promise.all([
+      uploadToB2(enKey, formatSrt(lines, false)),
+      uploadToB2(mmKey, formatSrt(lines, true)),
+      uploadToB2(recapKey, recap),
+      uploadToB2(highlightsKey, highlights),
+      uploadToB2(captionsKey, captions),
+    ])
+
+    // Step 5: Get signed URLs (24h)
+    const [enUrl, mmUrl, recapUrl, highlightsUrl, captionsUrl] = await Promise.all([
+      getSignedDownloadUrl(enKey),
+      getSignedDownloadUrl(mmKey),
+      getSignedDownloadUrl(recapKey),
+      getSignedDownloadUrl(highlightsKey),
+      getSignedDownloadUrl(captionsKey),
+    ])
+
+    // Step 6: Telegram notify
+    if (telegram_chat_id) {
+      const msg = `✅ <b>${videoTitle}</b> ပြီးပြီ!
+
+📥 <b>Download (24h):</b>
+🇲🇲 <a href="${mmUrl}">Myanmar .srt</a>
+🇬🇧 <a href="${enUrl}">English .srt</a>
+📝 <a href="${recapUrl}">Recap</a>
+🎯 <a href="${highlightsUrl}">Highlights</a>
+📱 <a href="${captionsUrl}">Captions + Hashtags</a>`
+
+      await sendMessage(telegram_chat_id, msg)
+    }
+
+    return NextResponse.json({
+      success: true,
+      title: videoTitle,
+      lines: lines.length,
+      downloads: { enUrl, mmUrl, recapUrl, highlightsUrl, captionsUrl },
+      recap,
+      highlights,
+      captions,
+    })
+
+  } catch (err: any) {
+    console.error('Submit error:', err)
+    return NextResponse.json({ error: err.message || 'Failed' }, { status: 500 })
+  } finally {
+    await rm(jobDir, { recursive: true, force: true })
+  }
+}
