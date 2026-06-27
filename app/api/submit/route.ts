@@ -6,102 +6,19 @@ import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
 import { SrtLine } from '@/types'
 import { randomUUID } from 'crypto'
 
-// cobalt.tools API — free, no binary needed
-async function downloadSubtitle(url: string): Promise<string> {
-  // Method 1: cobalt.tools မှာ video info ယူပြီး subtitle URL ရှာ
-  // Method 2: YouTube transcript API သုံး
-  
-  // YouTube video ID ထုတ်မယ်
-  const videoId = extractYouTubeId(url)
-  if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး။ YouTube link သာ support လုပ်တယ်')
-
-  // YouTube transcript ဆွဲမယ် (timedtext API)
-  const langs = ['zh-Hans', 'zh', 'en']
-  
-  for (const lang of langs) {
-    try {
-      const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`
-      const res = await fetch(transcriptUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-      })
-      
-      if (res.ok) {
-        const text = await res.text()
-        if (text && text.length > 100) {
-          console.log(`Got transcript in ${lang}`)
-          return convertTimedTextToSrt(text)
-        }
-      }
-    } catch {}
-  }
-
-  // Auto-generated subtitle (asr)
-  for (const lang of ['zh-Hans', 'zh', 'en']) {
-    try {
-      const asrUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&kind=asr&fmt=srv3`
-      const res = await fetch(asrUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-      })
-      if (res.ok) {
-        const text = await res.text()
-        if (text && text.length > 100) {
-          console.log(`Got ASR transcript in ${lang}`)
-          return convertTimedTextToSrt(text)
-        }
-      }
-    } catch {}
-  }
-
-  throw new Error('Subtitle မတွေ့ဘူး။ ဒီ video မှာ subtitle မပါဘူး ဖြစ်နိုင်တယ်')
-}
-
 function extractYouTubeId(url: string): string | null {
+  // Clean URL first — remove ?is= tracking params
   const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
-    /^([a-zA-Z0-9_-]{11})$/,
+    /[?&]v=([a-zA-Z0-9_-]{11})/,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /embed\/([a-zA-Z0-9_-]{11})/,
+    /shorts\/([a-zA-Z0-9_-]{11})/,
   ]
   for (const p of patterns) {
     const m = url.match(p)
     if (m) return m[1]
   }
   return null
-}
-
-function convertTimedTextToSrt(xml: string): string {
-  // Parse YouTube timedtext XML → SRT format
-  const lines: string[] = []
-  let index = 1
-
-  // Match <p t="start" d="duration">text</p> or <s ac="0">text</s>
-  const pRegex = /<p[^>]+t="(\d+)"[^>]+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g
-  let match
-
-  while ((match = pRegex.exec(xml)) !== null) {
-    const startMs = parseInt(match[1])
-    const durationMs = parseInt(match[2])
-    const endMs = startMs + durationMs
-
-    // Strip XML tags from text
-    const text = match[3]
-      .replace(/<[^>]+>/g, '')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .trim()
-
-    if (!text) continue
-
-    const start = msToSrtTime(startMs)
-    const end = msToSrtTime(endMs)
-
-    lines.push(`${index}\n${start} --> ${end}\n${text}`)
-    index++
-  }
-
-  if (!lines.length) throw new Error('Subtitle parse မဖြစ်ဘူး')
-  return lines.join('\n\n')
 }
 
 function msToSrtTime(ms: number): string {
@@ -112,19 +29,103 @@ function msToSrtTime(ms: number): string {
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(mil).padStart(3,'0')}`
 }
 
+function convertTimedTextToSrt(xml: string): string {
+  const lines: string[] = []
+  let index = 1
+  const pRegex = /<p[^>]+t="(\d+)"[^>]+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g
+  let match
+  while ((match = pRegex.exec(xml)) !== null) {
+    const startMs = parseInt(match[1])
+    const endMs = startMs + parseInt(match[2])
+    const text = match[3]
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').trim()
+    if (!text) continue
+    lines.push(`${index}\n${msToSrtTime(startMs)} --> ${msToSrtTime(endMs)}\n${text}`)
+    index++
+  }
+  if (!lines.length) throw new Error('XML parse မဖြစ်ဘူး')
+  return lines.join('\n\n')
+}
+
+async function downloadSubtitle(url: string): Promise<string> {
+  const videoId = extractYouTubeId(url)
+  if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး')
+
+  console.log('Video ID:', videoId)
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  }
+
+  // Try all lang + kind combinations
+  const attempts = [
+    { lang: 'zh-Hans', kind: '' },
+    { lang: 'zh-Hans', kind: 'asr' },
+    { lang: 'zh', kind: '' },
+    { lang: 'zh', kind: 'asr' },
+    { lang: 'en', kind: '' },
+    { lang: 'en', kind: 'asr' },
+  ]
+
+  for (const { lang, kind } of attempts) {
+    try {
+      const kindParam = kind ? `&kind=${kind}` : ''
+      const timedUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}${kindParam}&fmt=srv3&xorb=2&xobt=3&xovt=3`
+      console.log('Trying:', timedUrl)
+
+      const res = await fetch(timedUrl, { headers })
+      console.log(`${lang}${kind ? '+'+kind : ''} status:`, res.status)
+
+      if (res.ok) {
+        const text = await res.text()
+        console.log(`${lang} text length:`, text.length)
+        if (text && text.length > 200 && text.includes('<p')) {
+          return convertTimedTextToSrt(text)
+        }
+      }
+    } catch (e) {
+      console.log('Error:', e)
+    }
+  }
+
+  // Try getting available tracks list first
+  try {
+    const listUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`
+    const listRes = await fetch(listUrl, { headers })
+    const listText = await listRes.text()
+    console.log('Track list:', listText.slice(0, 500))
+
+    // Parse available langs from list
+    const langMatches = listText.matchAll(/lang_code="([^"]+)"/g)
+    for (const m of langMatches) {
+      const lang = m[1]
+      const trackUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`
+      const res = await fetch(trackUrl, { headers })
+      if (res.ok) {
+        const text = await res.text()
+        if (text && text.length > 200 && text.includes('<p')) {
+          return convertTimedTextToSrt(text)
+        }
+      }
+    }
+  } catch (e) {
+    console.log('List error:', e)
+  }
+
+  throw new Error('Subtitle မတွေ့ဘူး — SRT paste mode သုံးပါ')
+}
+
 async function callGemini(prompt: string): Promise<string> {
   for (const model of ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
-          }),
-        }
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 4096 } }) }
       )
       if (res.ok) {
         const d = await res.json()
