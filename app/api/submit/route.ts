@@ -1,18 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
 import { sendMessage } from '@/lib/telegram'
-import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
+import { parseSrt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
 import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
 import { SrtLine } from '@/types'
 import { randomUUID } from 'crypto'
 
 function extractYouTubeId(url: string): string | null {
-  // Clean URL first — remove ?is= tracking params
   const patterns = [
     /[?&]v=([a-zA-Z0-9_-]{11})/,
     /youtu\.be\/([a-zA-Z0-9_-]{11})/,
     /embed\/([a-zA-Z0-9_-]{11})/,
-    /shorts\/([a-zA-Z0-9_-]{11})/,
   ]
   for (const p of patterns) {
     const m = url.match(p)
@@ -29,94 +27,44 @@ function msToSrtTime(ms: number): string {
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(mil).padStart(3,'0')}`
 }
 
-function convertTimedTextToSrt(xml: string): string {
-  const lines: string[] = []
-  let index = 1
-  const pRegex = /<p[^>]+t="(\d+)"[^>]+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g
-  let match
-  while ((match = pRegex.exec(xml)) !== null) {
-    const startMs = parseInt(match[1])
-    const endMs = startMs + parseInt(match[2])
-    const text = match[3]
-      .replace(/<[^>]+>/g, '')
-      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').trim()
-    if (!text) continue
-    lines.push(`${index}\n${msToSrtTime(startMs)} --> ${msToSrtTime(endMs)}\n${text}`)
-    index++
-  }
-  if (!lines.length) throw new Error('XML parse မဖြစ်ဘူး')
-  return lines.join('\n\n')
-}
-
 async function downloadSubtitle(url: string): Promise<string> {
   const videoId = extractYouTubeId(url)
   if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး')
 
-  console.log('Video ID:', videoId)
+  // RapidAPI - YouTube Transcript API
+  const rapidApiKey = process.env.RAPIDAPI_KEY
+  if (!rapidApiKey) throw new Error('RAPIDAPI_KEY not set')
 
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  }
-
-  // Try all lang + kind combinations
-  const attempts = [
-    { lang: 'zh-Hans', kind: '' },
-    { lang: 'zh-Hans', kind: 'asr' },
-    { lang: 'zh', kind: '' },
-    { lang: 'zh', kind: 'asr' },
-    { lang: 'en', kind: '' },
-    { lang: 'en', kind: 'asr' },
-  ]
-
-  for (const { lang, kind } of attempts) {
-    try {
-      const kindParam = kind ? `&kind=${kind}` : ''
-      const timedUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}${kindParam}&fmt=srv3&xorb=2&xobt=3&xovt=3`
-      console.log('Trying:', timedUrl)
-
-      const res = await fetch(timedUrl, { headers })
-      console.log(`${lang}${kind ? '+'+kind : ''} status:`, res.status)
-
-      if (res.ok) {
-        const text = await res.text()
-        console.log(`${lang} text length:`, text.length)
-        if (text && text.length > 200 && text.includes('<p')) {
-          return convertTimedTextToSrt(text)
-        }
-      }
-    } catch (e) {
-      console.log('Error:', e)
+  const res = await fetch(
+    `https://youtube-transcripts.p.rapidapi.com/youtube/transcript?url=https://www.youtube.com/watch?v=${videoId}&chunkSize=500`,
+    {
+      headers: {
+        'x-rapidapi-host': 'youtube-transcripts.p.rapidapi.com',
+        'x-rapidapi-key': rapidApiKey,
+      },
     }
+  )
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Transcript API error: ${res.status} — ${err.slice(0, 100)}`)
   }
 
-  // Try getting available tracks list first
-  try {
-    const listUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`
-    const listRes = await fetch(listUrl, { headers })
-    const listText = await listRes.text()
-    console.log('Track list:', listText.slice(0, 500))
+  const data = await res.json()
 
-    // Parse available langs from list
-    const langMatches = listText.matchAll(/lang_code="([^"]+)"/g)
-    for (const m of langMatches) {
-      const lang = m[1]
-      const trackUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`
-      const res = await fetch(trackUrl, { headers })
-      if (res.ok) {
-        const text = await res.text()
-        if (text && text.length > 200 && text.includes('<p')) {
-          return convertTimedTextToSrt(text)
-        }
-      }
-    }
-  } catch (e) {
-    console.log('List error:', e)
-  }
+  // Convert to SRT
+  const content = data.content || data.transcript || []
+  if (!content.length) throw new Error('Subtitle မတွေ့ဘူး')
 
-  throw new Error('Subtitle မတွေ့ဘူး — SRT paste mode သုံးပါ')
+  const srtLines = content.map((item: any, i: number) => {
+    const startMs = Math.round((item.offset || item.start || 0) * 1000)
+    const durMs = Math.round((item.duration || 3) * 1000)
+    const endMs = startMs + durMs
+    const text = (item.text || '').replace(/\n/g, ' ').trim()
+    return `${i + 1}\n${msToSrtTime(startMs)} --> ${msToSrtTime(endMs)}\n${text}`
+  }).filter((l: string) => l.split('\n')[2]?.trim())
+
+  return srtLines.join('\n\n')
 }
 
 async function callGemini(prompt: string): Promise<string> {
@@ -138,9 +86,9 @@ async function callGemini(prompt: string): Promise<string> {
 }
 
 async function translateSrt(content: string, glossaryId?: string): Promise<SrtLine[]> {
-  const lines = content.trim().startsWith('WEBVTT') ? parseVtt(content) : parseSrt(content)
+  const lines = parseSrt(content)
   if (!lines.length) throw new Error('Could not parse subtitle')
-  const glossary = getGlossary(glossaryId || 'default-donghua')
+  const glossary = getGlossary(glossaryId || 'default-english')
   const chunks = chunkLines(lines, 60)
   let all: SrtLine[] = []
   for (const chunk of chunks) {
