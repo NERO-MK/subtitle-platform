@@ -13,33 +13,21 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.B2_BUCKET_NAME!
 
-// Upload file to B2
-export async function uploadToB2(
-  key: string,
-  content: string,
-  contentType = 'text/plain'
-): Promise<string> {
+export async function uploadToB2(key: string, content: string): Promise<string> {
   await s3.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-    Body: content,
-    ContentType: contentType,
+    Bucket: BUCKET, Key: key, Body: content, ContentType: 'text/plain',
   }))
   return key
 }
 
-// Generate signed URL (24h expiry)
 export async function getSignedDownloadUrl(key: string): Promise<string> {
-  const command = new GetObjectCommand({ Bucket: BUCKET, Key: key })
-  return getSignedUrl(s3, command, { expiresIn: 86400 }) // 24h
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 86400 })
 }
 
-// Delete file from B2
 export async function deleteFromB2(key: string): Promise<void> {
   await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))
 }
 
-// Delete multiple files
 export async function deleteFilesFromB2(keys: string[]): Promise<void> {
-  await Promise.all(keys.map(key => deleteFromB2(key)))
+  await Promise.all(keys.map(k => deleteFromB2(k)))
 }
