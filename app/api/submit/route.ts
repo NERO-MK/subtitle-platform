@@ -3,32 +3,42 @@ import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
 import { sendMessage } from '@/lib/telegram'
 import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
 import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
-import { rm, mkdir } from 'fs/promises'
+import { rm, mkdir, readdir, readFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { SrtLine } from '@/types'
-// @ts-ignore
-import ytDlp from 'yt-dlp-exec'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+const execAsync = promisify(exec)
+
+// yt-dlp-exec binary path
+function getYtDlpPath(): string {
+  try {
+    // yt-dlp-exec package ထဲက binary
+    const pkg = require.resolve('yt-dlp-exec/bin/yt-dlp')
+    return pkg
+  } catch {
+    // fallback paths
+    const paths = [
+      join(process.cwd(), 'node_modules/yt-dlp-exec/bin/yt-dlp'),
+      join(process.cwd(), 'node_modules/.bin/yt-dlp'),
+      '/var/task/node_modules/yt-dlp-exec/bin/yt-dlp',
+    ]
+    return paths[0]
+  }
+}
 
 async function downloadSubtitle(url: string, jobDir: string): Promise<string> {
   await mkdir(jobDir, { recursive: true })
 
-  // yt-dlp-exec သုံးမယ် — system binary မလို
-  const result = await ytDlp(url, {
-    skipDownload: true,
-    writeSubs: true,
-    writeAutoSubs: true,
-    subLangs: 'zh-Hans,zh,en',
-    subFormat: 'vtt/srt/best',
-    convertSubs: 'srt',
-    output: join(jobDir, '%(title)s.%(ext)s'),
-    noPlaylist: true,
-    dumpSingleJson: false,
-  })
+  const ytdlp = getYtDlpPath()
+  const cmd = `"${ytdlp}" --skip-download --write-subs --write-auto-subs --sub-langs "zh-Hans,zh,en" --sub-format "vtt/srt/best" --convert-subs srt --output "${join(jobDir, '%(title)s.%(ext)s')}" --no-playlist "${url}"`
 
-  // Find subtitle file
-  const { readdir, readFile } = await import('fs/promises')
+  console.log('yt-dlp path:', ytdlp)
+  await execAsync(cmd, { timeout: 30000 })
+
   const files = await readdir(jobDir)
   const subFile = files.find(f => f.endsWith('.srt') || f.endsWith('.vtt'))
   if (!subFile) throw new Error('No subtitle found for this video')
@@ -96,17 +106,11 @@ export async function POST(req: NextRequest) {
     const { url, title, telegram_chat_id, glossaryId } = await req.json()
     if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
 
-    // Download subtitle
     const srtContent = await downloadSubtitle(url, jobDir)
     const videoTitle = title || 'Video'
-
-    // Translate
     const lines = await translateSrt(srtContent, glossaryId)
-
-    // Generate content
     const { recap, highlights, captions } = await generateContent(lines, videoTitle)
 
-    // Upload to B2
     const jobId = randomUUID().slice(0, 8)
     const keys = {
       en: `jobs/${jobId}/subtitle.en.srt`,
@@ -132,21 +136,16 @@ export async function POST(req: NextRequest) {
       getSignedDownloadUrl(keys.captions),
     ])
 
-    // Telegram notify
     if (telegram_chat_id) {
       await sendMessage(telegram_chat_id,
-        `✅ <b>${videoTitle}</b> ပြီးပြီ!\n\n📥 <b>Download (24h):</b>\n🇲🇲 <a href="${mmUrl}">Myanmar .srt</a>\n🇬🇧 <a href="${enUrl}">English .srt</a>\n📝 <a href="${recapUrl}">Recap</a>\n🎯 <a href="${highlightsUrl}">Highlights</a>\n📱 <a href="${captionsUrl}">Captions</a>`
+        `✅ <b>${videoTitle}</b> ပြီးပြီ!\n\n📥 Download (24h):\n🇲🇲 <a href="${mmUrl}">Myanmar .srt</a>\n🇬🇧 <a href="${enUrl}">English .srt</a>\n📝 <a href="${recapUrl}">Recap</a>\n🎯 <a href="${highlightsUrl}">Highlights</a>\n📱 <a href="${captionsUrl}">Captions</a>`
       )
     }
 
     return NextResponse.json({
-      success: true,
-      title: videoTitle,
-      lines: lines.length,
+      success: true, title: videoTitle, lines: lines.length,
       downloads: { enUrl, mmUrl, recapUrl, highlightsUrl, captionsUrl },
-      recap,
-      highlights,
-      captions,
+      recap, highlights, captions,
     })
 
   } catch (err: any) {
