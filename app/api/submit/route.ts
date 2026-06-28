@@ -30,49 +30,47 @@ function msToSrtTime(ms: number): string {
 
 async function downloadTranscript(url: string): Promise<string> {
   const videoId = extractYouTubeId(url)
-  const queryUrl = videoId 
-    ? `https://www.youtube.com/watch?v=${videoId}`
-    : url
+  if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး')
 
-  // Try Chinese first, then English
-  for (const lang of ['cn', 'en', 'auto']) {
-    try {
-      const res = await fetch(
-        `https://solid-ap.p.rapidapi.com/api/transcript-with-url?url=${encodeURIComponent(queryUrl)}&lang=${lang}`,
-        {
-          headers: {
-            'x-rapidapi-host': 'solid-ap.p.rapidapi.com',
-            'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
-          },
-        }
-      )
+  console.log('Video ID:', videoId)
 
-      if (!res.ok) continue
-
-      const data = await res.json()
-      console.log(`Got transcript lang=${lang}, type:`, typeof data)
-
-      // Convert to SRT
-      const items = Array.isArray(data) ? data : data.transcript || data.content || []
-      if (!items.length) continue
-
-      const srtLines = items.map((item: any, i: number) => {
-        const startMs = Math.round((item.offset || item.start || 0) * 1000)
-        const durMs = Math.round((item.duration || 3) * 1000)
-        const text = (item.text || item.content || '').replace(/\n/g, ' ').trim()
-        if (!text) return null
-        return `${i + 1}\n${msToSrtTime(startMs)} --> ${msToSrtTime(startMs + durMs)}\n${text}`
-      }).filter(Boolean)
-
-      if (srtLines.length > 0) {
-        return srtLines.join('\n\n')
-      }
-    } catch (e) {
-      console.log(`lang=${lang} error:`, e)
+  // Try VideoId endpoint first
+  const res = await fetch(
+    `https://youtube-transcript3.p.rapidapi.com/api/transcript?videoId=${videoId}&lang=en`,
+    {
+      headers: {
+        'x-rapidapi-host': 'youtube-transcript3.p.rapidapi.com',
+        'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
+      },
     }
+  )
+
+  console.log('RapidAPI status:', res.status)
+
+  if (!res.ok) {
+    const err = await res.text()
+    console.log('RapidAPI error:', err)
+    throw new Error(`Transcript API error: ${res.status}`)
   }
 
-  throw new Error('Transcript မတွေ့ဘူး — SRT paste mode သုံးပါ')
+  const data = await res.json()
+  console.log('RapidAPI response type:', typeof data, Array.isArray(data))
+
+  const items = Array.isArray(data) ? data : data.transcript || data.content || []
+  if (!items.length) throw new Error('Transcript empty')
+
+  const srtLines = items
+    .map((item: any, i: number) => {
+      const startMs = Math.round((item.offset || item.start || 0) * 1000)
+      const durMs = Math.round((item.duration || 3) * 1000)
+      const text = (item.text || item.content || '').replace(/\n/g, ' ').trim()
+      if (!text) return null
+      return `${i + 1}\n${msToSrtTime(startMs)} --> ${msToSrtTime(startMs + durMs)}\n${text}`
+    })
+    .filter(Boolean)
+
+  if (!srtLines.length) throw new Error('Transcript parse မဖြစ်ဘူး')
+  return srtLines.join('\n\n')
 }
 
 async function callGemini(prompt: string): Promise<string> {
