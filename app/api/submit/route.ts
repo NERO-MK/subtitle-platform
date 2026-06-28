@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { uploadToB2, getSignedDownloadUrl } from '@/lib/b2'
 import { sendMessage } from '@/lib/telegram'
-import { parseSrt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
+import { parseSrt, parseVtt, chunkLines, linesToText, parseTranslatedText } from '@/lib/srt'
 import { buildTranslatePrompt, getGlossary } from '@/lib/glossary'
 import { SrtLine } from '@/types'
 import { randomUUID } from 'crypto'
@@ -20,57 +20,89 @@ function extractYouTubeId(url: string): string | null {
   return null
 }
 
-function msToSrtTime(ms: number): string {
-  const h = Math.floor(ms / 3600000)
-  const m = Math.floor((ms % 3600000) / 60000)
-  const s = Math.floor((ms % 60000) / 1000)
-  const mil = ms % 1000
-  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(mil).padStart(3,'0')}`
+async function getAvailableLanguages(videoId: string): Promise<string[]> {
+  try {
+    const res = await fetch(
+      `https://nikzefer.p.rapidapi.com/language-list/${videoId}`,
+      {
+        headers: {
+          'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
+          'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
+        },
+      }
+    )
+    if (!res.ok) return ['en']
+    const data = await res.json()
+    console.log('Available langs:', JSON.stringify(data).slice(0, 200))
+    if (Array.isArray(data)) {
+      return data.map((l: any) => l.languageCode || l.lang || l)
+    }
+    return ['en']
+  } catch {
+    return ['en']
+  }
 }
 
-async function downloadTranscript(url: string): Promise<string> {
+async function downloadSubtitle(url: string): Promise<string> {
   const videoId = extractYouTubeId(url)
   if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး')
 
   console.log('Video ID:', videoId)
 
-  // Try VideoId endpoint first
+  // Get available languages first
+  const langs = await getAvailableLanguages(videoId)
+  console.log('Langs:', langs)
+
+  // Priority: Chinese first, then English
+  const priority = ['zh-Hans', 'zh', 'zh-CN', 'zh-TW', 'en', 'en-US']
+  const targetLang = priority.find(l => langs.some(al =>
+    al.toLowerCase().includes(l.toLowerCase())
+  )) || langs[0] || 'en'
+
+  console.log('Using lang:', targetLang)
+
+  // Download SRT
   const res = await fetch(
-    `https://youtube-transcript3.p.rapidapi.com/api/transcript?videoId=${videoId}&lang=en`,
+    `https://nikzefer.p.rapidapi.com/download-srt/${videoId}?language=${targetLang}`,
     {
       headers: {
-        'x-rapidapi-host': 'youtube-transcript3.p.rapidapi.com',
+        'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
         'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
       },
     }
   )
 
-  console.log('RapidAPI status:', res.status)
+  console.log('Download status:', res.status)
 
   if (!res.ok) {
     const err = await res.text()
-    console.log('RapidAPI error:', err)
-    throw new Error(`Transcript API error: ${res.status}`)
+    console.log('Download error:', err)
+    // Try English as fallback
+    if (targetLang !== 'en') {
+      const res2 = await fetch(
+        `https://nikzefer.p.rapidapi.com/download-srt/${videoId}?language=en`,
+        {
+          headers: {
+            'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
+          },
+        }
+      )
+      if (res2.ok) {
+        return res2.text()
+      }
+    }
+    throw new Error('Subtitle မတွေ့ဘူး — SRT paste mode သုံးပါ')
   }
 
-  const data = await res.json()
-  console.log('RapidAPI response type:', typeof data, Array.isArray(data))
+  const content = await res.text()
+  console.log('SRT length:', content.length)
 
-  const items = Array.isArray(data) ? data : data.transcript || data.content || []
-  if (!items.length) throw new Error('Transcript empty')
+  if (!content || content.length < 50) {
+    throw new Error('Subtitle empty')
+  }
 
-  const srtLines = items
-    .map((item: any, i: number) => {
-      const startMs = Math.round((item.offset || item.start || 0) * 1000)
-      const durMs = Math.round((item.duration || 3) * 1000)
-      const text = (item.text || item.content || '').replace(/\n/g, ' ').trim()
-      if (!text) return null
-      return `${i + 1}\n${msToSrtTime(startMs)} --> ${msToSrtTime(startMs + durMs)}\n${text}`
-    })
-    .filter(Boolean)
-
-  if (!srtLines.length) throw new Error('Transcript parse မဖြစ်ဘူး')
-  return srtLines.join('\n\n')
+  return content
 }
 
 async function callGemini(prompt: string): Promise<string> {
@@ -78,8 +110,14 @@ async function callGemini(prompt: string): Promise<string> {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 4096 } }) }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
+          }),
+        }
       )
       if (res.ok) {
         const d = await res.json()
@@ -92,7 +130,7 @@ async function callGemini(prompt: string): Promise<string> {
 }
 
 async function translateSrt(content: string, glossaryId?: string): Promise<SrtLine[]> {
-  const lines = parseSrt(content)
+  const lines = content.trim().startsWith('WEBVTT') ? parseVtt(content) : parseSrt(content)
   if (!lines.length) throw new Error('Could not parse subtitle')
   const isEnglish = !content.match(/[\u4e00-\u9fff]/)
   const glossary = getGlossary(glossaryId || (isEnglish ? 'default-english' : 'default-donghua'))
@@ -127,7 +165,7 @@ export async function POST(req: NextRequest) {
     const { url, title, telegram_chat_id, glossaryId } = await req.json()
     if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
 
-    const srtContent = await downloadTranscript(url)
+    const srtContent = await downloadSubtitle(url)
     const videoTitle = title || 'Video'
     const lines = await translateSrt(srtContent, glossaryId)
     const { recap, highlights, captions } = await generateContent(lines, videoTitle)
