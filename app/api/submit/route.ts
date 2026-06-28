@@ -20,88 +20,70 @@ function extractYouTubeId(url: string): string | null {
   return null
 }
 
-async function getAvailableLanguages(videoId: string): Promise<string[]> {
-  try {
-    const res = await fetch(
-      `https://nikzefer.p.rapidapi.com/language-list/${videoId}`,
-      {
-        headers: {
-          'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
-          'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
-        },
-      }
-    )
-    if (!res.ok) return ['en']
-    const data = await res.json()
-    console.log('Available langs:', JSON.stringify(data).slice(0, 200))
-    if (Array.isArray(data)) {
-      return data.map((l: any) => l.languageCode || l.lang || l)
-    }
-    return ['en']
-  } catch {
-    return ['en']
-  }
-}
+const RAPID_HOST = 'youtube-captions-transcript-subtitles-video-combiner.p.rapidapi.com'
 
 async function downloadSubtitle(url: string): Promise<string> {
   const videoId = extractYouTubeId(url)
   if (!videoId) throw new Error('YouTube URL မဟုတ်ဘူး')
 
-  console.log('Video ID:', videoId)
+  const key = process.env.RAPIDAPI_KEY!
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-rapidapi-host': RAPID_HOST,
+    'x-rapidapi-key': key,
+  }
 
-  // Get available languages first
-  const langs = await getAvailableLanguages(videoId)
-  console.log('Langs:', langs)
-
-  // Priority: Chinese first, then English
-  const priority = ['zh-Hans', 'zh', 'zh-CN', 'zh-TW', 'en', 'en-US']
-  const targetLang = priority.find(l => langs.some(al =>
-    al.toLowerCase().includes(l.toLowerCase())
-  )) || langs[0] || 'en'
-
-  console.log('Using lang:', targetLang)
-
-  // Download SRT
-  const res = await fetch(
-    `https://nikzefer.p.rapidapi.com/download-srt/${videoId}?language=${targetLang}`,
-    {
-      headers: {
-        'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
-        'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
-      },
-    }
-  )
-
-  console.log('Download status:', res.status)
-
-  if (!res.ok) {
-    const err = await res.text()
-    console.log('Download error:', err)
-    // Try English as fallback
-    if (targetLang !== 'en') {
-      const res2 = await fetch(
-        `https://nikzefer.p.rapidapi.com/download-srt/${videoId}?language=en`,
-        {
-          headers: {
-            'x-rapidapi-host': 'nikzefer.p.rapidapi.com',
-            'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
-          },
+  // Step 1: Get available languages
+  let targetLang = 'en'
+  try {
+    const langRes = await fetch(
+      `https://${RAPID_HOST}/language-list/${videoId}`,
+      { headers }
+    )
+    if (langRes.ok) {
+      const langs = await langRes.json()
+      console.log('Langs:', JSON.stringify(langs).slice(0, 300))
+      const priority = ['zh-Hans', 'zh', 'zh-CN', 'en']
+      if (Array.isArray(langs)) {
+        for (const p of priority) {
+          const found = langs.find((l: any) =>
+            (l.languageCode || l.lang || l || '').toLowerCase().startsWith(p.toLowerCase())
+          )
+          if (found) {
+            targetLang = found.languageCode || found.lang || found
+            break
+          }
         }
-      )
-      if (res2.ok) {
-        return res2.text()
       }
     }
-    throw new Error('Subtitle မတွေ့ဘူး — SRT paste mode သုံးပါ')
+  } catch (e) {
+    console.log('Lang list error:', e)
   }
 
-  const content = await res.text()
-  console.log('SRT length:', content.length)
+  console.log('Target lang:', targetLang)
 
-  if (!content || content.length < 50) {
-    throw new Error('Subtitle empty')
+  // Step 2: Download SRT
+  const srtRes = await fetch(
+    `https://${RAPID_HOST}/download-srt/${videoId}?language=${targetLang}&response_mode=default`,
+    { headers }
+  )
+
+  console.log('SRT status:', srtRes.status)
+
+  if (!srtRes.ok) {
+    // Fallback English
+    const enRes = await fetch(
+      `https://${RAPID_HOST}/download-srt/${videoId}?language=en&response_mode=default`,
+      { headers }
+    )
+    if (!enRes.ok) {
+      throw new Error(`Subtitle မတွေ့ဘူး (${enRes.status})`)
+    }
+    return enRes.text()
   }
 
+  const content = await srtRes.text()
+  if (!content || content.length < 50) throw new Error('Subtitle empty')
   return content
 }
 
@@ -110,14 +92,8 @@ async function callGemini(prompt: string): Promise<string> {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
-          }),
-        }
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 4096 } }) }
       )
       if (res.ok) {
         const d = await res.json()
