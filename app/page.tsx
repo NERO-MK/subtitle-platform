@@ -10,10 +10,7 @@ type InputMode = 'paste' | 'url'
 type Tab = 'translate' | 'submit'
 
 export default function Home() {
-  // Tab
   const [tab, setTab] = useState<Tab>('translate')
-
-  // Translate tab
   const [mode, setMode] = useState<InputMode>('paste')
   const [url, setUrl] = useState('')
   const [pastedSrt, setPastedSrt] = useState('')
@@ -26,15 +23,12 @@ export default function Home() {
 
   // Submit tab
   const [submitUrl, setSubmitUrl] = useState('')
-  const [submitTitle, setSubmitTitle] = useState('')
-  const [telegramChatId, setTelegramChatId] = useState('')
-  const [submitStatus, setSubmitStatus] = useState<'idle'|'processing'|'done'|'error'>('idle')
-  const [submitResult, setSubmitResult] = useState<any>(null)
+  const [submitStatus, setSubmitStatus] = useState<'idle'|'loading'|'done'|'error'>('idle')
   const [submitError, setSubmitError] = useState('')
+  const [availableLangs, setAvailableLangs] = useState<{code:string,name:string}[]>([])
 
-  const glossaries = loadGlossaries()
+  const glossaries = typeof window !== 'undefined' ? loadGlossaries() : []
 
-  // ── Translate tab ──────────────────────────────────────
   async function handleTranslate() {
     setStatus('idle')
     setLines([])
@@ -48,7 +42,6 @@ export default function Home() {
       setStatus('downloading')
       setMessage('Downloading subtitle...')
       setProgress(20)
-
       const res = await fetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -80,7 +73,6 @@ export default function Home() {
 
     setLines(data2.lines)
     setStatus('done')
-    setMessage('Done!')
     setProgress(100)
 
     try {
@@ -89,28 +81,30 @@ export default function Home() {
     } catch {}
   }
 
-  // ── Submit tab (URL → full pipeline) ──────────────────
   async function handleSubmit() {
     if (!submitUrl.trim()) return
-    setSubmitStatus('processing')
+    setSubmitStatus('loading')
     setSubmitError('')
-    setSubmitResult(null)
+    setAvailableLangs([])
 
     try {
       const res = await fetch('/api/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: submitUrl,
-          title: submitTitle || undefined,
-          telegram_chat_id: telegramChatId || undefined,
-          glossaryId,
-        }),
+        body: JSON.stringify({ url: submitUrl }),
       })
       const data = await res.json()
       if (!res.ok || data.error) throw new Error(data.error || 'Failed')
-      setSubmitResult(data)
+
+      // Auto-fill SRT into translate tab
+      setPastedSrt(data.srtContent)
+      setAvailableLangs(data.availableLanguages || [])
       setSubmitStatus('done')
+
+      // Switch to translate tab
+      setTab('translate')
+      setMode('paste')
+
     } catch (err: any) {
       setSubmitError(err.message)
       setSubmitStatus('error')
@@ -130,11 +124,8 @@ export default function Home() {
   const mySrt = lines.length ? formatSrt(lines, true) : ''
   const safeName = (title || 'subtitle').replace(/[^a-zA-Z0-9_\u1000-\u109F]/g, '_').slice(0, 60)
 
-  const s = { background: '#0e0e12', color: '#e8e6de', fontFamily: 'system-ui,sans-serif' }
-
   return (
-    <main style={{ minHeight: '100vh', ...s }}>
-      {/* Header */}
+    <main style={{ minHeight: '100vh', background: '#0e0e12', color: '#e8e6de', fontFamily: 'system-ui,sans-serif' }}>
       <header style={{ borderBottom: '1px solid #2a2a32', padding: '14px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div>
           <span style={{ fontSize: 18, fontWeight: 600, color: '#fff' }}>SubMM</span>
@@ -149,11 +140,11 @@ export default function Home() {
 
       <div style={{ maxWidth: 720, margin: '0 auto', padding: '32px 20px' }}>
 
-        {/* Main tabs */}
+        {/* Tabs */}
         <div style={{ display: 'flex', gap: 8, marginBottom: 28, background: '#1a1a22', borderRadius: 10, padding: 4 }}>
           {[
             { key: 'translate', label: '📄 SRT Translate' },
-            { key: 'submit', label: '🚀 Full Pipeline' },
+            { key: 'submit', label: '🔗 URL → SRT' },
           ].map(t => (
             <button key={t.key} onClick={() => setTab(t.key as Tab)}
               style={{ flex: 1, padding: '10px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 14, fontWeight: 500,
@@ -164,10 +155,60 @@ export default function Home() {
           ))}
         </div>
 
-        {/* ── TRANSLATE TAB ── */}
+        {/* URL → SRT tab */}
+        {tab === 'submit' && (
+          <div>
+            <p style={{ color: '#888', fontSize: 14, marginBottom: 20 }}>
+              YouTube URL ထည့်ရင် SRT download လုပ်ပြီး Translate tab ကို auto-fill လုပ်ပေးမယ်
+            </p>
+            <div style={{ background: '#16161e', border: '1px solid #2a2a32', borderRadius: 12, padding: 20, marginBottom: 16 }}>
+              <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>YouTube URL</label>
+              <input value={submitUrl} onChange={e => setSubmitUrl(e.target.value)}
+                placeholder="https://youtu.be/..."
+                onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+                style={{ width: '100%', padding: '12px 14px', borderRadius: 8, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 15, outline: 'none', boxSizing: 'border-box' }} />
+            </div>
+
+            <button onClick={handleSubmit} disabled={submitStatus === 'loading'}
+              style={{ width: '100%', padding: '14px', borderRadius: 10, border: 'none',
+                background: submitStatus === 'loading' ? '#3a3a52' : '#7c6af7',
+                color: '#fff', fontSize: 16, fontWeight: 600, cursor: 'pointer' }}>
+              {submitStatus === 'loading' ? '⏳ Downloading SRT...' : '⬇ Download SRT →'}
+            </button>
+
+            {submitStatus === 'done' && (
+              <div style={{ marginTop: 16, padding: '14px', background: '#122212', border: '1px solid #1e4a1e', borderRadius: 8, fontSize: 14, color: '#6ab86a' }}>
+                ✅ SRT downloaded! Translate tab ကို auto-fill လုပ်ပြီးပြီ → Translate နှိပ်ပါ
+              </div>
+            )}
+
+            {submitStatus === 'error' && (
+              <div style={{ marginTop: 16, padding: '14px', background: '#2a1515', border: '1px solid #5a2222', borderRadius: 8, color: '#ff8080', fontSize: 14 }}>
+                ❌ {submitError}
+              </div>
+            )}
+
+            {availableLangs.length > 0 && (
+              <div style={{ marginTop: 12, padding: '12px', background: '#16161e', borderRadius: 8 }}>
+                <p style={{ fontSize: 12, color: '#666', marginBottom: 6 }}>Available languages:</p>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {availableLangs.map(l => (
+                    <span key={l.code} style={{ fontSize: 12, color: '#888', background: '#2a2a32', padding: '3px 8px', borderRadius: 4 }}>
+                      {l.name} ({l.code})
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Translate tab */}
         {tab === 'translate' && (
           <div>
-            <p style={{ color: '#888', fontSize: 14, marginBottom: 20 }}>SRT paste ဒါမှမဟုတ် URL → Myanmar + English .srt download</p>
+            <p style={{ color: '#888', fontSize: 14, marginBottom: 20 }}>
+              SRT paste ဒါမှမဟုတ် URL → Myanmar + English .srt download
+            </p>
 
             <div style={{ display: 'flex', gap: 8, marginBottom: 16, background: '#1a1a22', borderRadius: 8, padding: 4, width: 'fit-content' }}>
               {(['paste', 'url'] as InputMode[]).map(m => (
@@ -189,13 +230,17 @@ export default function Home() {
                 </div>
               ) : (
                 <div>
-                  <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>SRT / VTT paste လုပ်ပါ</label>
+                  <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>
+                    SRT / VTT paste လုပ်ပါ
+                    {pastedSrt && <span style={{ color: '#6ab86a', marginLeft: 8 }}>✓ auto-filled</span>}
+                  </label>
                   <textarea value={pastedSrt} onChange={e => setPastedSrt(e.target.value)}
-                    placeholder={"1\n00:00:01,000 --> 00:00:03,000\n你好世界"}
+                    placeholder={"1\n00:00:01,000 --> 00:00:03,000\nHello World"}
                     rows={7}
                     style={{ width: '100%', padding: '12px', borderRadius: 8, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 13, fontFamily: 'monospace', outline: 'none', resize: 'vertical', boxSizing: 'border-box' }} />
                 </div>
               )}
+
               <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 10 }}>
                 <label style={{ fontSize: 13, color: '#888' }}>Glossary</label>
                 <select value={glossaryId} onChange={e => setGlossaryId(e.target.value)}
@@ -248,130 +293,6 @@ export default function Home() {
                   style={{ display: 'block', textAlign: 'center', padding: '11px', borderRadius: 10, border: '1px solid #2a2a3e', color: '#b8a8ff', textDecoration: 'none', fontSize: 14 }}>
                   ✏️ Editor မှာ review →
                 </Link>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── FULL PIPELINE TAB ── */}
-        {tab === 'submit' && (
-          <div>
-            <p style={{ color: '#888', fontSize: 14, marginBottom: 20 }}>
-              URL ထည့်ပေးရုံနဲ့ — subtitle translate + recap + highlights + captions အကုန် generate လုပ်ပေးမယ်
-            </p>
-
-            <div style={{ background: '#16161e', border: '1px solid #2a2a32', borderRadius: 12, padding: 20, marginBottom: 16 }}>
-              <div style={{ marginBottom: 14 }}>
-                <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>Video URL *</label>
-                <input value={submitUrl} onChange={e => setSubmitUrl(e.target.value)}
-                  placeholder="https://www.youtube.com/watch?v=..."
-                  style={{ width: '100%', padding: '12px 14px', borderRadius: 8, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 15, outline: 'none', boxSizing: 'border-box' }} />
-              </div>
-
-              <div style={{ marginBottom: 14 }}>
-                <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>Title (optional)</label>
-                <input value={submitTitle} onChange={e => setSubmitTitle(e.target.value)}
-                  placeholder="Renegade Immortal Episode 146"
-                  style={{ width: '100%', padding: '12px 14px', borderRadius: 8, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 15, outline: 'none', boxSizing: 'border-box' }} />
-              </div>
-
-              <div style={{ marginBottom: 14 }}>
-                <label style={{ display: 'block', fontSize: 13, color: '#888', marginBottom: 8 }}>
-                  Telegram Chat ID <span style={{ color: '#555' }}>(ပြီးရင် Telegram မှာ notify ရမယ်)</span>
-                </label>
-                <input value={telegramChatId} onChange={e => setTelegramChatId(e.target.value)}
-                  placeholder="123456789"
-                  style={{ width: '100%', padding: '12px 14px', borderRadius: 8, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 15, outline: 'none', boxSizing: 'border-box' }} />
-                <p style={{ fontSize: 12, color: '#555', marginTop: 6 }}>@userinfobot ကို message ပို့ရင် ID ရမယ်</p>
-              </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <label style={{ fontSize: 13, color: '#888' }}>Glossary</label>
-                <select value={glossaryId} onChange={e => setGlossaryId(e.target.value)}
-                  style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #2a2a32', background: '#0e0e12', color: '#e8e6de', fontSize: 14, outline: 'none' }}>
-                  <option value="">None</option>
-                  {glossaries.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
-                </select>
-              </div>
-            </div>
-
-            <button onClick={handleSubmit} disabled={submitStatus === 'processing'}
-              style={{ width: '100%', padding: '14px', borderRadius: 10, border: 'none',
-                background: submitStatus === 'processing' ? '#3a3a52' : '#7c6af7',
-                color: '#fff', fontSize: 16, fontWeight: 600, cursor: submitStatus === 'processing' ? 'not-allowed' : 'pointer' }}>
-              {submitStatus === 'processing' ? '⏳ Processing... (1-2 mins)' : '🚀 Generate All →'}
-            </button>
-
-            {submitStatus === 'processing' && (
-              <div style={{ marginTop: 14, padding: '14px', background: '#16161e', borderRadius: 8, fontSize: 13, color: '#888' }}>
-                <p>⏳ Subtitle download လုပ်နေတယ်...</p>
-                <p>🔄 Myanmar translate လုပ်နေတယ်...</p>
-                <p>✍️ Recap + Highlights generate လုပ်နေတယ်...</p>
-                <p style={{ color: '#555', marginTop: 8 }}>1-3 minutes လောက် ကြာနိုင်တယ်</p>
-              </div>
-            )}
-
-            {submitStatus === 'error' && (
-              <div style={{ marginTop: 14, padding: '14px', background: '#2a1515', border: '1px solid #5a2222', borderRadius: 8, color: '#ff8080', fontSize: 14 }}>
-                ❌ {submitError}
-              </div>
-            )}
-
-            {submitStatus === 'done' && submitResult && (
-              <div style={{ marginTop: 20 }}>
-                <div style={{ padding: '12px 16px', background: '#122212', border: '1px solid #1e4a1e', borderRadius: 8, marginBottom: 16, fontSize: 14, color: '#6ab86a' }}>
-                  ✅ {submitResult.title} — {submitResult.lines} lines translated
-                </div>
-
-                {/* Downloads */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
-                  <a href={submitResult.downloads.mmUrl} download
-                    style={{ padding: '13px', borderRadius: 10, border: 'none', background: '#7c6af7', color: '#fff', fontSize: 14, fontWeight: 600, textAlign: 'center', textDecoration: 'none', display: 'block' }}>
-                    ⬇ Myanmar .srt
-                  </a>
-                  <a href={submitResult.downloads.enUrl} download
-                    style={{ padding: '13px', borderRadius: 10, border: '1px solid #2a2a32', background: '#16161e', color: '#e8e6de', fontSize: 14, textAlign: 'center', textDecoration: 'none', display: 'block' }}>
-                    ⬇ English .srt
-                  </a>
-                  <a href={submitResult.downloads.recapUrl} download
-                    style={{ padding: '13px', borderRadius: 10, border: '1px solid #2a2a32', background: '#16161e', color: '#e8e6de', fontSize: 14, textAlign: 'center', textDecoration: 'none', display: 'block' }}>
-                    📝 Recap
-                  </a>
-                  <a href={submitResult.downloads.highlightsUrl} download
-                    style={{ padding: '13px', borderRadius: 10, border: '1px solid #2a2a32', background: '#16161e', color: '#e8e6de', fontSize: 14, textAlign: 'center', textDecoration: 'none', display: 'block' }}>
-                    🎯 Highlights
-                  </a>
-                  <a href={submitResult.downloads.captionsUrl} download
-                    style={{ padding: '13px', borderRadius: 10, border: '1px solid #2a2a32', background: '#16161e', color: '#e8e6de', fontSize: 14, textAlign: 'center', textDecoration: 'none', display: 'block', gridColumn: '1/-1' }}>
-                    📱 Captions + Hashtags
-                  </a>
-                </div>
-
-                {/* Recap preview */}
-                {submitResult.recap && (
-                  <div style={{ background: '#16161e', border: '1px solid #2a2a32', borderRadius: 10, padding: 16, marginBottom: 12 }}>
-                    <p style={{ fontSize: 13, color: '#7c6af7', marginBottom: 8, fontWeight: 600 }}>📝 Recap</p>
-                    <p style={{ fontSize: 14, color: '#c8c0f0', lineHeight: 1.6 }}>{submitResult.recap.slice(0, 400)}...</p>
-                  </div>
-                )}
-
-                {/* Highlights preview */}
-                {submitResult.highlights && (
-                  <div style={{ background: '#16161e', border: '1px solid #2a2a32', borderRadius: 10, padding: 16, marginBottom: 12 }}>
-                    <p style={{ fontSize: 13, color: '#f7a06a', marginBottom: 8, fontWeight: 600 }}>🎯 Highlights</p>
-                    <p style={{ fontSize: 13, color: '#e8d0b0', lineHeight: 1.7, whiteSpace: 'pre-line' }}>{submitResult.highlights.slice(0, 500)}</p>
-                  </div>
-                )}
-
-                {/* Captions preview */}
-                {submitResult.captions && (
-                  <div style={{ background: '#16161e', border: '1px solid #2a2a32', borderRadius: 10, padding: 16 }}>
-                    <p style={{ fontSize: 13, color: '#6af7b0', marginBottom: 8, fontWeight: 600 }}>📱 Captions + Hashtags</p>
-                    <p style={{ fontSize: 13, color: '#b0e8d0', lineHeight: 1.7, whiteSpace: 'pre-line' }}>{submitResult.captions.slice(0, 500)}</p>
-                  </div>
-                )}
-
-                <p style={{ fontSize: 12, color: '#555', marginTop: 12, textAlign: 'center' }}>⚠️ Download links 24h သာ ရမယ်</p>
               </div>
             )}
           </div>
