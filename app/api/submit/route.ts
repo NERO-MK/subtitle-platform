@@ -1,78 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-function extractYouTubeId(url: string): string | null {
-  const patterns = [
-    /[?&]v=([a-zA-Z0-9_-]{11})/,
-    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
-    /embed\/([a-zA-Z0-9_-]{11})/,
-    /shorts\/([a-zA-Z0-9_-]{11})/,
-  ]
-  for (const p of patterns) {
-    const m = url.match(p)
-    if (m) return m[1]
-  }
-  return null
-}
-
-const RAPID_HOST = 'youtube-captions-transcript-subtitles-video-combiner.p.rapidapi.com'
-
 export async function POST(req: NextRequest) {
   try {
     const { url } = await req.json()
     if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 })
 
-    const videoId = extractYouTubeId(url)
-    if (!videoId) return NextResponse.json({ error: 'YouTube URL မဟုတ်ဘူး' }, { status: 400 })
+    const serviceUrl = process.env.YTDLP_SERVICE_URL
+    if (!serviceUrl) return NextResponse.json({ error: 'Service not configured' }, { status: 500 })
 
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-rapidapi-host': RAPID_HOST,
-      'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
-    }
+    // Railway yt-dlp service ကို call
+    const res = await fetch(`${serviceUrl}/subtitle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
 
-    // Get available languages
-    let availableLangs: any[] = []
-    let targetLang = 'en'
-    try {
-      const langRes = await fetch(`https://${RAPID_HOST}/language-list/${videoId}`, { headers })
-      if (langRes.ok) {
-        availableLangs = await langRes.json()
-        const priority = ['zh-Hans', 'zh', 'zh-CN', 'en']
-        for (const p of priority) {
-          const found = availableLangs.find((l: any) =>
-            (l.languageCode || '').toLowerCase().startsWith(p.toLowerCase())
-          )
-          if (found) { targetLang = found.languageCode; break }
-        }
-      }
-    } catch {}
+    const data = await res.json()
 
-    // Download SRT
-    let srtContent = ''
-    for (const lang of [targetLang, 'en']) {
-      const res = await fetch(
-        `https://${RAPID_HOST}/download-srt/${videoId}?language=${lang}&response_mode=default`,
-        { headers }
-      )
-      if (res.ok) {
-        const content = await res.text()
-        if (content && content.length > 50) {
-          srtContent = content
-          break
-        }
-      }
-    }
-
-    if (!srtContent) {
-      return NextResponse.json({ error: 'Subtitle မတွေ့ဘူး' }, { status: 404 })
+    if (!res.ok || data.error) {
+      return NextResponse.json({ error: data.error || 'Download failed' }, { status: 400 })
     }
 
     return NextResponse.json({
       success: true,
-      videoId,
-      language: targetLang,
-      availableLanguages: availableLangs.map((l: any) => ({ code: l.languageCode, name: l.name })),
-      srtContent,
+      title: data.title,
+      srtContent: data.content,
     })
 
   } catch (err: any) {
